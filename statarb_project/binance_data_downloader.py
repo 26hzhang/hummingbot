@@ -383,17 +383,88 @@ class BinanceDataDownloader:
             logger.error(f"Private API test failed: {e}")
             return False
 
-    def check_file_exists(self, symbol: str, market_type: str, interval: str, start_date: str, end_date: str, force_redownload: bool = False) -> bool:
+    def get_existing_file_time_range(self, symbol: str, market_type: str, interval: str) -> Optional[Tuple[datetime, datetime]]:
+        """获取已存在文件的时间范围 / Get time range of existing file"""
+        market_dir = self.data_dir / f"{market_type}_{interval}"
+        filename = f"{symbol}_{interval}.csv"
+        file_path = market_dir / filename
+        
+        if not file_path.exists():
+            return None
+            
+        try:
+            # 读取CSV文件的第一行和最后一行来获取时间范围 / Read first and last row to get time range
+            df = pd.read_csv(file_path)
+            if len(df) == 0:
+                return None
+                
+            # 解析时间字符串 / Parse time strings
+            first_time_str = df.iloc[0]['open_time']
+            last_time_str = df.iloc[-1]['open_time']
+            
+            first_time = datetime.strptime(first_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            last_time = datetime.strptime(last_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            
+            return (first_time, last_time)
+            
+        except Exception as e:
+            logger.warning(f"Failed to read existing file time range for {symbol}: {e}")
+            return None
+    
+    def calculate_download_ranges(self, symbol: str, market_type: str, interval: str, 
+                                 requested_start: datetime, requested_end: datetime) -> List[Tuple[datetime, datetime]]:
+        """计算需要下载的时间范围，实现增量下载逻辑 / Calculate download ranges for incremental download"""
+        existing_range = self.get_existing_file_time_range(symbol, market_type, interval)
+        
+        if existing_range is None:
+            # 文件不存在，下载整个请求范围 / File doesn't exist, download entire requested range
+            return [(requested_start, requested_end)]
+            
+        file_start, file_end = existing_range
+        download_ranges = []
+        
+        logger.info(f"Existing file range for {symbol}: {file_start.strftime('%Y-%m-%d %H:%M:%S')} to {file_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Requested range: {requested_start.strftime('%Y-%m-%d %H:%M:%S')} to {requested_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 情况1: 请求的开始时间小于文件开始时间 / Case 1: requested start < file start
+        if requested_start < file_start:
+            if requested_end < file_start:
+                # 请求范围在文件范围之前，需要连接 / Requested range before file range, need to connect
+                download_ranges.append((requested_start, file_start))
+                logger.info(f"Adding pre-file range: {requested_start.strftime('%Y-%m-%d %H:%M:%S')} to {file_start.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                # 补充下载从请求开始到文件开始的部分 / Download from requested start to file start
+                download_ranges.append((requested_start, file_start))
+                logger.info(f"Adding prefix range: {requested_start.strftime('%Y-%m-%d %H:%M:%S')} to {file_start.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 情况2: 请求的结束时间大于文件结束时间 / Case 2: requested end > file end
+        if requested_end > file_end:
+            if requested_start > file_end:
+                # 请求范围在文件范围之后，需要连接 / Requested range after file range, need to connect
+                download_ranges.append((file_end, requested_end))
+                logger.info(f"Adding post-file range: {file_end.strftime('%Y-%m-%d %H:%M:%S')} to {requested_end.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                # 补充下载从文件结束到请求结束的部分 / Download from file end to requested end
+                download_ranges.append((file_end, requested_end))
+                logger.info(f"Adding suffix range: {file_end.strftime('%Y-%m-%d %H:%M:%S')} to {requested_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        if not download_ranges:
+            logger.info(f"No additional data needed for {symbol}, existing file covers requested range")
+        
+        return download_ranges
+
+    def check_file_exists(self, symbol: str, market_type: str, interval: str, start_date: str = None, end_date: str = None, force_redownload: bool = False) -> bool:
         """检查文件是否已存在 / Check if file already exists"""
         if force_redownload:
             return False
 
+        # 使用新的文件名格式 / Use new filename format
         market_dir = self.data_dir / f"{market_type}_{interval}"
-        filename = f"{symbol}_{start_date}_{end_date}.csv"
+        filename = f"{symbol}_{interval}.csv"
         file_path = market_dir / filename
 
         if file_path.exists():
-            logger.info(f"文件已存在，跳过下载: {file_path} / File exists, skipping download: {file_path}")
+            logger.info(f"文件已存在，将进行增量检查: {file_path} / File exists, will perform incremental check: {file_path}")
             return True
         return False
 
@@ -572,8 +643,8 @@ class BinanceDataDownloader:
 
         return str(file_path)
 
-    def merge_temp_files(self, symbol: str, market_type: str, interval: str, start_date: str, end_date: str) -> int:
-        """合并临时文件并清理 / Merge temporary files and cleanup"""
+    def merge_temp_files_with_existing(self, symbol: str, market_type: str, interval: str) -> int:
+        """合并临时文件与已存在文件并清理 / Merge temporary files with existing file and cleanup"""
         temp_dir = self._get_temp_dir(symbol)
         temp_files = sorted(temp_dir.glob(f"*_{symbol}_{interval}_*.csv"))
 
@@ -585,6 +656,20 @@ class BinanceDataDownloader:
         all_data = []
         total_records = 0
 
+        # 加载现有文件数据（如果存在）/ Load existing file data if exists
+        market_dir = self.data_dir / f"{market_type}_{interval}"
+        existing_file = market_dir / f"{symbol}_{interval}.csv"
+        
+        if existing_file.exists():
+            try:
+                existing_df = pd.read_csv(existing_file)
+                all_data.append(existing_df)
+                total_records += len(existing_df)
+                logger.info(f"Loaded {len(existing_df)} existing records from {existing_file}")
+            except Exception as e:
+                logger.warning(f"Failed to read existing file {existing_file}: {e}")
+
+        # 加载临时文件数据 / Load temporary file data
         for temp_file in temp_files:
             try:
                 df = pd.read_csv(temp_file)
@@ -596,101 +681,123 @@ class BinanceDataDownloader:
 
         final_records = 0
         if all_data:
-            # 合并数据并去重 / Merge data and remove duplicates
+            # 合并数据并去重，按时间排序 / Merge data, remove duplicates, and sort by time
             combined_df = pd.concat(all_data, ignore_index=True)
             combined_df = combined_df.drop_duplicates(subset=['open_time']).sort_values('open_time')
 
             # 保存最终文件 / Save final file
             final_records = len(combined_df)
-            final_file = self.save_csv_from_dataframe(combined_df, symbol, market_type, interval, start_date, end_date)
+            final_file = self.save_csv_from_dataframe(combined_df, symbol, market_type, interval)
 
-            logger.info(f"Merged {symbol} data: {total_records} -> {final_records} records, saved to {final_file}")
+            logger.info(f"Merged {symbol} data: {total_records} -> {final_records} records (removed duplicates), saved to {final_file}")
 
         # 清理临时文件 / Clean up temporary files
         self._cleanup_temp_dir(symbol)
 
         return final_records
 
-    def save_csv_from_dataframe(self, df: pd.DataFrame, symbol: str, market_type: str, interval: str, start_date: str, end_date: str) -> str:
+    def merge_temp_files(self, symbol: str, market_type: str, interval: str) -> int:
+        """合并临时文件并清理 / Merge temporary files and cleanup"""
+        # 使用新的合并函数，支持与现有文件合并 / Use new merge function that supports merging with existing file
+        return self.merge_temp_files_with_existing(symbol, market_type, interval)
+
+    def save_csv_from_dataframe(self, df: pd.DataFrame, symbol: str, market_type: str, interval: str) -> str:
         """从DataFrame保存CSV文件 / Save CSV file from DataFrame"""
         market_dir = self.data_dir / f"{market_type}_{interval}"
         market_dir.mkdir(exist_ok=True)
 
-        filename = f"{symbol}_{start_date}_{end_date}.csv"
+        filename = f"{symbol}_{interval}.csv"
         file_path = market_dir / filename
 
         df.to_csv(file_path, index=False)
         return str(file_path)
 
     async def download_symbol_data(self, symbol: str, market_type: str, interval: str, start_dt: datetime, end_dt: datetime, force_redownload: bool = False) -> Tuple[int, int]:
-        """下载单个币种的数据 / Download data for a single symbol"""
+        """下载单个币种的数据，支持增量下载 / Download data for a single symbol with incremental support"""
         # 检查文件是否已存在 / Check if file already exists
         start_date_str = start_dt.strftime('%Y%m%d')
         end_date_str = end_dt.strftime('%Y%m%d')
 
-        if self.check_file_exists(symbol, market_type, interval, start_date_str, end_date_str, force_redownload):
-            # 读取已存在文件的记录数 / Read record count from existing file
-            try:
-                market_dir = self.data_dir / f"{market_type}_{interval}"
-                filename = f"{symbol}_{start_date_str}_{end_date_str}.csv"
-                file_path = market_dir / filename
-                df = pd.read_csv(file_path)
-                return len(df), 0  # 返回记录数和0个失败块 / Return record count and 0 failed chunks
-            except Exception as e:
-                logger.warning(f"Failed to read existing file {symbol}: {e}, will re-download")
+        if force_redownload:
+            # 强制重新下载，使用原来的逻辑 / Force redownload, use original logic
+            download_ranges = [(start_dt, end_dt)]
+        else:
+            # 计算需要下载的时间范围（增量逻辑）/ Calculate download ranges (incremental logic)
+            download_ranges = self.calculate_download_ranges(symbol, market_type, interval, start_dt, end_dt)
+            
+            if not download_ranges:
+                # 不需要下载新数据，返回现有文件的记录数 / No new data needed, return existing file record count
+                try:
+                    market_dir = self.data_dir / f"{market_type}_{interval}"
+                    file_path = market_dir / f"{symbol}_{interval}.csv"
+                    df = pd.read_csv(file_path)
+                    logger.info(f"No download needed for {symbol}, existing file has {len(df)} records")
+                    return len(df), 0
+                except Exception as e:
+                    logger.warning(f"Failed to read existing file {symbol}: {e}, will re-download")
+                    download_ranges = [(start_dt, end_dt)]
 
         async with self.semaphore:  # 控制并发 / Control concurrency
             try:
-                # 生成时间分块 / Generate time chunks
-                chunks = self.generate_chunks(start_dt, end_dt, chunk_hours=24)
-
                 temp_dir = self._get_temp_dir(symbol)
                 downloaded_records = 0
                 failed_chunks = 0
+                total_chunks = 0
 
-                # 创建进度条 / Create progress bar
-                progress_bar = tqdm(
-                    total=len(chunks),
-                    desc=f"{symbol:>12s}",
-                    leave=True,
-                    unit="chunk",
-                    ncols=100
-                )
+                # 处理每个需要下载的时间范围 / Process each download range
+                for range_idx, (range_start, range_end) in enumerate(download_ranges):
+                    logger.info(f"Downloading range {range_idx + 1}/{len(download_ranges)} for {symbol}: {range_start.strftime('%Y-%m-%d %H:%M:%S')} to {range_end.strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    # 生成时间分块 / Generate time chunks
+                    chunks = self.generate_chunks(range_start, range_end, chunk_hours=24)
+                    total_chunks += len(chunks)
 
-                try:
-                    for i, (chunk_start, chunk_end) in enumerate(chunks):
-                        start_ts = int(chunk_start.timestamp())
-                        end_ts = int(chunk_end.timestamp())
+                    # 创建进度条 / Create progress bar
+                    progress_bar = tqdm(
+                        total=len(chunks),
+                        desc=f"{symbol:>12s} R{range_idx+1}",
+                        leave=True,
+                        unit="chunk",
+                        ncols=100
+                    )
 
-                        # 检查是否已下载 / Check if already downloaded
-                        temp_filename = f"chunk_{i:04d}_{symbol}_{interval}_{start_ts}_{end_ts}.csv"
-                        temp_file_path = temp_dir / temp_filename
+                    try:
+                        for i, (chunk_start, chunk_end) in enumerate(chunks):
+                            start_ts = int(chunk_start.timestamp())
+                            end_ts = int(chunk_end.timestamp())
 
-                        if temp_file_path.exists():
+                            # 检查是否已下载 / Check if already downloaded
+                            temp_filename = f"chunk_{range_idx}_{i:04d}_{symbol}_{interval}_{start_ts}_{end_ts}.csv"
+                            temp_file_path = temp_dir / temp_filename
+
+                            if temp_file_path.exists():
+                                progress_bar.update(1)
+                                continue
+
+                            # 下载数据 / Download data
+                            data = await self.download_klines_chunk(symbol, interval, start_ts, end_ts, market_type)
+
+                            if data:
+                                # 保存到临时文件 / Save to temporary file
+                                self._save_temp_chunk(temp_file_path, data)
+                                downloaded_records += len(data)
+                            else:
+                                failed_chunks += 1
+                                logger.warning(f"Failed to download chunk {i} for {symbol}")
+
                             progress_bar.update(1)
-                            continue
 
-                        # 下载数据 / Download data
-                        data = await self.download_klines_chunk(symbol, interval, start_ts, end_ts, market_type)
+                            # 短暂延迟避免请求过快 / Brief delay to avoid requests too fast
+                            await asyncio.sleep(0.1)
 
-                        if data:
-                            # 保存到临时文件 / Save to temporary file
-                            self._save_temp_chunk(temp_file_path, data)
-                            downloaded_records += len(data)
-                        else:
-                            failed_chunks += 1
-                            logger.warning(f"Failed to download chunk {i} for {symbol}")
+                    finally:
+                        progress_bar.close()
 
-                        progress_bar.update(1)
-
-                        # 短暂延迟避免请求过快 / Brief delay to avoid requests too fast
-                        await asyncio.sleep(0.1)
-
-                finally:
-                    progress_bar.close()
-
-                # 合并临时文件 / Merge temporary files
-                final_records = self.merge_temp_files(symbol, market_type, interval, start_date_str, end_date_str)
+                # 合并临时文件与现有文件 / Merge temporary files with existing file
+                final_records = self.merge_temp_files(symbol, market_type, interval)
+                
+                if download_ranges and final_records > 0:
+                    logger.info(f"Successfully downloaded {downloaded_records} new records for {symbol}, total records: {final_records}")
 
                 return final_records, failed_chunks
 
@@ -879,11 +986,13 @@ async def main():
     parser.add_argument('--market-type', choices=['spot', 'futures'], default='futures', help='市场类型 / Market type (default: futures)')
     parser.add_argument('--interval', default='5m', help='时间间隔 / Time interval (default: 1h). 可选: 1m, 5m, 10m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, 1M')
     parser.add_argument('--start-time', default="2023-01-01", help='开始时间 YYYY-MM-DD / Start time YYYY-MM-DD')
-    parser.add_argument('--end-time', default="2025-08-16", help='结束时间 YYYY-MM-DD / End time YYYY-MM-DD')
+    parser.add_argument('--end-time', default=None, help='结束时间 YYYY-MM-DD / End time YYYY-MM-DD')
     parser.add_argument('--api-key', default=None, help='Binance API Key (可选，用于认证API) / Binance API Key (optional, for authenticated API)')
     parser.add_argument('--api-secret', default=None, help='Binance API Secret (可选，用于认证API) / Binance API Secret (optional, for authenticated API)')
     parser.add_argument('--test-private-api', action='store_true', help='测试私有API访问（需要API密钥）/ Test private API access (requires API keys)')
     parser.add_argument('--force-redownload', action='store_true', help='强制重新下载，忽略已存在的文件 / Force re-download, ignore existing files')
+    parser.add_argument('--incremental', action='store_true', default=True, help='启用增量下载模式，自动补充缺失的时间段数据 / Enable incremental download mode, automatically fill missing time periods (default: True)')
+    parser.add_argument('--no-incremental', action='store_true', help='禁用增量下载模式，总是下载完整时间范围 / Disable incremental download mode, always download complete time range')
 
     args = parser.parse_args()
 
@@ -896,6 +1005,12 @@ async def main():
     if (args.api_key and not args.api_secret) or (args.api_secret and not args.api_key):
         print("错误: 必须同时提供 --api-key 和 --api-secret 参数 / Error: Both --api-key and --api-secret must be provided together")
         return
+    
+    # 处理增量下载设置 / Handle incremental download settings
+    if args.no_incremental:
+        args.incremental = False
+        args.force_redownload = True  # 禁用增量模式时自动启用强制重下载
+        logger.info("增量下载已禁用，将下载完整时间范围 / Incremental download disabled, will download complete time range")
 
     # 如果指定了symbols，则不使用top_volume
     if args.symbols:
@@ -940,6 +1055,9 @@ async def main():
             volume_type=args.volume_type,
             force_redownload=args.force_redownload
         )
+        
+        if args.incremental and not args.force_redownload:
+            logger.info("增量下载模式已启用，仅下载缺失的时间段数据 / Incremental download mode enabled, only downloading missing time period data")
 
         logger.info(f"日志文件已保存到: {log_file_path}")
 
