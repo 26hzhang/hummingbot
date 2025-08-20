@@ -155,15 +155,15 @@ class BinanceDataDownloader:
         self.warning_cooldown = 300  # 5分钟内不重复相同警告
         self.global_silence_until = 0  # 全局静默到某个时间
 
-    def _get_temp_dir(self, symbol: str) -> Path:
-        """获取指定交易对的临时目录 / Get temporary directory for symbol"""
-        temp_symbol_dir = self.temp_data_dir / symbol
+    def _get_temp_dir(self, symbol: str, interval: str) -> Path:
+        """获取指定交易对和时间间隔的临时目录 / Get temporary directory for symbol and interval"""
+        temp_symbol_dir = self.temp_data_dir / f"{symbol}_{interval}"
         temp_symbol_dir.mkdir(exist_ok=True)
         return temp_symbol_dir
 
-    def _cleanup_temp_dir(self, symbol: str):
-        """清理指定交易对的临时目录 / Clean up temporary directory for symbol"""
-        temp_symbol_dir = self.temp_data_dir / symbol
+    def _cleanup_temp_dir(self, symbol: str, interval: str):
+        """清理指定交易对和时间间隔的临时目录 / Clean up temporary directory for symbol and interval"""
+        temp_symbol_dir = self.temp_data_dir / f"{symbol}_{interval}"
         if temp_symbol_dir.exists():
             shutil.rmtree(temp_symbol_dir)
             logger.info(f"Cleaned up temporary directory: {temp_symbol_dir}")
@@ -645,12 +645,12 @@ class BinanceDataDownloader:
 
     def merge_temp_files_with_existing(self, symbol: str, market_type: str, interval: str) -> int:
         """合并临时文件与已存在文件并清理 / Merge temporary files with existing file and cleanup"""
-        temp_dir = self._get_temp_dir(symbol)
+        temp_dir = self._get_temp_dir(symbol, interval)
         temp_files = sorted(temp_dir.glob(f"*_{symbol}_{interval}_*.csv"))
 
         if not temp_files:
             # 清理空的临时目录 / Clean up empty temp directory
-            self._cleanup_temp_dir(symbol)
+            self._cleanup_temp_dir(symbol, interval)
             return 0
 
         all_data = []
@@ -692,7 +692,7 @@ class BinanceDataDownloader:
             logger.info(f"Merged {symbol} data: {total_records} -> {final_records} records (removed duplicates), saved to {final_file}")
 
         # 清理临时文件 / Clean up temporary files
-        self._cleanup_temp_dir(symbol)
+        self._cleanup_temp_dir(symbol, interval)
 
         return final_records
 
@@ -739,7 +739,7 @@ class BinanceDataDownloader:
 
         async with self.semaphore:  # 控制并发 / Control concurrency
             try:
-                temp_dir = self._get_temp_dir(symbol)
+                temp_dir = self._get_temp_dir(symbol, interval)
                 downloaded_records = 0
                 failed_chunks = 0
                 total_chunks = 0
