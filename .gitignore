@@ -99,3 +99,5 @@ coverage.xml
 
 .claude
 pairstrade-fyp-2019/
+*.json
+*.joblib

@@ -1,0 +1,2 @@
+python3 binance_data_downloader.py --symbols 1000FLOKIUSDT ATOMUSDT CHZUSDT IMXUSDT EOSUSDT STXUSDT APTUSDT  NEARUSDT INJUSDT HBARUSDT ALGOUSDT --interval 5m --start-time 2023-01-01
+nohup python3 /storage/tianzichen/sicheng/hummingbot/stat_arb_project/analysis/v8.0/statarb_ml_data_collector.py > /storage/tianzichen/sicheng/hummingbot/stat_arb_project/analysis/v8.0/ml_data.txt
